@@ -27,8 +27,12 @@ pip install numpy pandas pynrrd antspyx scipy matplotlib
 
 ---
 
-## Example Run
+## Example Runs
 
 ```bash
-ce_13_cell_metadata_rot30.csv --slice 64
+# Quick search with 90° steps (tests 0°, 90°, 180°, 270°)
+python registration_pipeline.py --atlas data/aba_nissl.nrrd --omics data/cells.csv --slice 64 --search-rotation
+
+# Fine search with 30° steps (tests 12 orientations)
+python registration_pipeline.py --atlas data/aba_nissl.nrrd --omics data/cells.csv --slice 64 --search-rotation --rotation-step 30
 ```

@@ -1,0 +1,11 @@
+Quality Flag: PASS
+Rotation Used: 0.0°
+
+Post-affine (before SyN):
+  Dice: 0.6546
+  Correlation: 0.3221
+
+Post-SyN (final):
+  Mutual Information: 0.3431
+  Correlation: 0.4180
+  Dice: 0.7246

@@ -1,0 +1,13 @@
+file,expected,detected,error
+abca3_slice_13_cell_metadata.csv,0.0,344.0,16.0
+abca3_slice_13_cell_metadata_rot120.csv,120.0,104.0,16.0
+abca3_slice_13_cell_metadata_rot150.csv,150.0,134.0,16.0
+abca3_slice_13_cell_metadata_rot180.csv,180.0,164.0,16.0
+abca3_slice_13_cell_metadata_rot210.csv,210.0,194.0,16.0
+abca3_slice_13_cell_metadata_rot240.csv,240.0,224.0,16.0
+abca3_slice_13_cell_metadata_rot270.csv,270.0,254.0,16.0
+abca3_slice_13_cell_metadata_rot30.csv,30.0,14.0,16.0
+abca3_slice_13_cell_metadata_rot300.csv,300.0,284.0,16.0
+abca3_slice_13_cell_metadata_rot330.csv,330.0,314.0,16.0
+abca3_slice_13_cell_metadata_rot60.csv,60.0,44.0,16.0
+abca3_slice_13_cell_metadata_rot90.csv,90.0,74.0,16.0

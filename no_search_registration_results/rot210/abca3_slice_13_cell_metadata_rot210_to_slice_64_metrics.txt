@@ -1,0 +1,11 @@
+Quality Flag: REVIEW
+Rotation Used: 0.0°
+
+Post-affine (before SyN):
+  Dice: 0.6347
+  Correlation: 0.2878
+
+Post-SyN (final):
+  Mutual Information: 0.5061
+  Correlation: 0.4219
+  Dice: 0.8760

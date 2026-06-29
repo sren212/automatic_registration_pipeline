@@ -1,21 +1,19 @@
+#!/usr/bin/env python3
 """
 Automated image registration pipeline for aligning developmental mouse brain
-spatial omics data to KimLab 3D developmental Brain CCF atlases.
+spatial omics data to KimLab 3D developmental Brain CCF atlases using ANTsPy.
 """
 
 import argparse
-from pathlib import Path
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
+from typing import Tuple, List, Optional, Dict, Any
 
+import ants
 import numpy as np
 import pandas as pd
-import nrrd
-import ants
 from scipy.ndimage import gaussian_filter
-import matplotlib.pyplot as plt
-import matplotlib as mpl
 
 
 class SliceOrientation(Enum):
@@ -25,546 +23,551 @@ class SliceOrientation(Enum):
 
 
 class RegistrationMetric(Enum):
-    MATTES = "mattes"
-    MEANSQUARES = "meansquares"
-    GC = "gc"
+    MUTUAL_INFORMATION = "mattes"
+    CORRELATION = "gc"
 
 
 @dataclass
 class ImageMetadata:
-    origin: tuple[float, float]
-    spacing: tuple[float, float]
-    shape: tuple[int, int]
+    source_path: Path
+    slice_index: int
+    orientation: SliceOrientation
+    original_shape: Tuple[int, int]
+    resolution_um: float
 
 
 @dataclass
 class RegistrationConfig:
-    rasterization_resolution: float = 50.0
-    gaussian_blur_sigma: float = 1.0
-    registration_metric: RegistrationMetric = RegistrationMetric.MATTES
-    transform_type: str = "SyNRA"
-    syn_iterations: tuple[int, ...] = (200, 200, 200, 50)
-    affine_iterations: tuple[int, ...] = (2100, 1200, 1200, 10)
-    similarity_threshold: float = 0.3
+    rotation_deg: float = 0.0
+    scale: Tuple[float, float] = (0.9, 0.9)
+    mirror_x: bool = False
+    resolution_um: float = 50.0
+    blur_sigma: float = 1.0
+    search_rotation: bool = False
+    rotation_range: Tuple[float, float] = (0, 360)
+    rotation_step: float = 15.0
+    search_mirror: bool = False
 
 
 @dataclass
 class QualityMetrics:
-    mutual_information: float
+    dice_coefficient: float
     correlation: float
-    dice_overlap: float
-    registration_converged: bool
-    quality_flag: str
+    pre_registration_dice: float
+    pre_registration_correlation: float
+    flag: str
 
 
 @dataclass
 class RegistrationResult:
+    metadata: ImageMetadata
+    config: RegistrationConfig
+    quality: QualityMetrics
+    transform: Any
     warped_image: np.ndarray
-    forward_transforms: list[str]
-    inverse_transforms: list[str]
-    warped_coordinates: pd.DataFrame
-    quality_metrics: QualityMetrics
-    fixed_metadata: ImageMetadata
-    moving_metadata: ImageMetadata
+    detected_rotation: Optional[float] = None
+    detected_mirror: Optional[bool] = None
 
 
 class AtlasLoader:
-    def __init__(self, atlas_path: str):
-        self.atlas_path = Path(atlas_path)
-        self.volume, self.header = nrrd.read(str(self.atlas_path))
-        self._parse_header()
+    """Handles loading and slicing of 3D atlas volumes."""
 
-    def _parse_header(self):
-        self.voxel_spacing = np.diag(self.header['space directions'])
-        self.origin = self.header.get('space origin', np.zeros(3))
-        self.shape = self.volume.shape
-        self._compute_coordinates()
+    def __init__(self, atlas_path: Path):
+        self.atlas_path = atlas_path
+        self.volume = self._load_volume()
 
-    def _compute_coordinates(self):
-        self.coordinates = [
-            np.arange(n) * d + o
-            for n, d, o in zip(self.shape, self.voxel_spacing, self.origin)
-        ]
+    def _load_volume(self) -> np.ndarray:
+        if self.atlas_path.suffix == '.npy':
+            return np.load(self.atlas_path)
+        elif self.atlas_path.suffix in ['.nii', '.gz']:
+            return ants.image_read(str(self.atlas_path)).numpy()
+        else:
+            raise ValueError(f"Unsupported atlas format: {self.atlas_path.suffix}")
 
-    def get_slice(
-        self,
-        slice_index: int,
-        orientation: SliceOrientation
-    ) -> tuple[np.ndarray, ImageMetadata]:
-        axis_map = {
-            SliceOrientation.SAGITTAL: 2,
-            SliceOrientation.CORONAL: 0,
-            SliceOrientation.AXIAL: 1
-        }
-        axis = axis_map[orientation]
-
-        slice_2d = np.take(self.volume, slice_index, axis=axis).astype(np.float32)
-
-        other_axes = [i for i in range(3) if i != axis]
-        origin = tuple(float(self.coordinates[ax][0]) for ax in other_axes)
-        spacing = tuple(float(self.voxel_spacing[ax]) for ax in other_axes)
-
-        metadata = ImageMetadata(
-            origin=origin,
-            spacing=spacing,
-            shape=slice_2d.shape
-        )
-
-        return slice_2d, metadata
+    def get_slice(self, index: int, orientation: SliceOrientation) -> np.ndarray:
+        if orientation == SliceOrientation.CORONAL:
+            return self.volume[index, :, :]
+        elif orientation == SliceOrientation.SAGITTAL:
+            return self.volume[:, index, :]
+        elif orientation == SliceOrientation.AXIAL:
+            return self.volume[:, :, index]
 
 
 class SpatialOmicsPreprocessor:
+    """Preprocesses spatial omics data for registration."""
+
     def __init__(self, config: RegistrationConfig):
         self.config = config
 
-    def load_data(self, data_path: str) -> pd.DataFrame:
-        return pd.read_csv(data_path)
 
-    def filter_by_z(self, df: pd.DataFrame, z_value: float) -> pd.DataFrame:
-        return df[df['z'] == z_value].copy()
+def extract_coordinates(omics_path: Path) -> np.ndarray:
+    """Extract spatial coordinates from omics file. Returns (y, x) to match atlas convention."""
+    df = pd.read_csv(omics_path)
+    x_col = next(c for c in df.columns if c.lower() in ['x', 'x_um', 'x_coord'])
+    y_col = next(c for c in df.columns if c.lower() in ['y', 'y_um', 'y_coord'])
+    return np.column_stack([df[y_col].values, df[x_col].values])
 
-    def get_unique_z_values(self, df: pd.DataFrame) -> np.ndarray:
-        return df['z'].unique()
 
-    def extract_coordinates(
-        self,
-        df: pd.DataFrame,
-        x_col: str = 'x',
-        y_col: str = 'y',
-        scale_factor: float = 1000.0
-    ) -> tuple[np.ndarray, np.ndarray]:
-        x = df[x_col].to_numpy() * scale_factor
-        y = df[y_col].to_numpy() * scale_factor
-        return x, y
+def transform_coordinates(coords: np.ndarray, config: RegistrationConfig) -> np.ndarray:
+    """Apply rotation, scale, and mirror transformations to coordinates."""
+    transformed = coords.copy().astype(float)
 
-    def transform_coordinates(
-        self,
-        x: np.ndarray,
-        y: np.ndarray,
-        rotation_deg: float = 270.0,
-        scale: tuple[float, float] = (0.9, 0.9),
-        mirror_x: bool = True
-    ) -> tuple[np.ndarray, np.ndarray]:
-        theta = np.deg2rad(rotation_deg)
-        scale_x, scale_y = scale
+    # Center coordinates
+    centroid = transformed.mean(axis=0)
+    transformed -= centroid
 
-        if mirror_x:
-            v1 = -scale_x * y
-        else:
-            v1 = scale_x * y
-        v2 = scale_y * x
+    # Apply rotation
+    theta = np.radians(config.rotation_deg)
+    rotation_matrix = np.array([
+        [np.cos(theta), -np.sin(theta)],
+        [np.sin(theta), np.cos(theta)]
+    ])
+    transformed = transformed @ rotation_matrix.T
 
-        x_transformed = np.cos(theta) * v1 - np.sin(theta) * v2
-        y_transformed = np.sin(theta) * v1 + np.cos(theta) * v2
+    # Apply scale
+    transformed[:, 0] *= config.scale[0]
+    transformed[:, 1] *= config.scale[1]
 
-        return x_transformed, y_transformed
+    # Apply mirror
+    if config.mirror_x:
+        transformed[:, 1] = -transformed[:, 1]
 
-    def center_coordinates(
-        self,
-        x: np.ndarray,
-        y: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray]:
-        return x - np.mean(x), y - np.mean(y)
+    # Shift to positive coordinates
+    transformed -= transformed.min(axis=0)
 
-    def rasterize(
-        self,
-        x: np.ndarray,
-        y: np.ndarray,
-        resolution: Optional[float] = None,
-        blur_sigma: Optional[float] = None
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        resolution = resolution or self.config.rasterization_resolution
-        blur_sigma = blur_sigma or self.config.gaussian_blur_sigma
+    return transformed
 
-        x_edges = np.arange(np.min(x), np.max(x) + resolution, resolution)
-        y_edges = np.arange(np.min(y), np.max(y) + resolution, resolution)
 
-        density, y_bins, x_bins = np.histogram2d(y, x, bins=[y_edges, x_edges])
+def rasterize(
+    coords: np.ndarray,
+    atlas_shape: Tuple[int, int],
+    blur_sigma: float
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Convert point coordinates to density image matching atlas dimensions."""
+    ap_coords, dv_coords = coords[:, 0], coords[:, 1]
 
-        if blur_sigma > 0:
-            density = gaussian_filter(density, sigma=blur_sigma)
+    ap_min, ap_max = ap_coords.min(), ap_coords.max()
+    dv_min, dv_max = dv_coords.min(), dv_coords.max()
 
-        x_centers = x_bins[:-1] + resolution / 2.0
-        y_centers = y_bins[:-1] + resolution / 2.0
+    ap_normalized = (ap_coords - ap_min) / (ap_max - ap_min) * (atlas_shape[0] - 1)
+    dv_normalized = (dv_coords - dv_min) / (dv_max - dv_min) * (atlas_shape[1] - 1)
 
-        return x_centers, y_centers, density.astype(np.float32)
+    density, _, _ = np.histogram2d(
+        ap_normalized, dv_normalized,
+        bins=[atlas_shape[0], atlas_shape[1]],
+        range=[[0, atlas_shape[0]], [0, atlas_shape[1]]]
+    )
+
+    if blur_sigma > 0:
+        density = gaussian_filter(density, sigma=blur_sigma)
+
+    Y_grid, X_grid = np.mgrid[0:atlas_shape[0], 0:atlas_shape[1]]
+
+    return X_grid, Y_grid, density
 
 
 class ImageRegistrar:
+    """Performs image registration using ANTsPy."""
+
     def __init__(self, config: RegistrationConfig):
         self.config = config
 
-    def create_ants_image(
+    def affine_register(
         self,
-        data: np.ndarray,
-        metadata: ImageMetadata
-    ) -> ants.ANTsImage:
-        return ants.from_numpy(
-            data,
-            origin=metadata.origin,
-            spacing=metadata.spacing
+        moving: ants.ANTsImage,
+        fixed: ants.ANTsImage
+    ) -> Dict[str, Any]:
+        """Perform affine-only registration."""
+        result = ants.registration(
+            fixed=fixed,
+            moving=moving,
+            type_of_transform='Affine',
+            metric='mattes'
         )
-
-    def normalize_image(self, image: ants.ANTsImage) -> ants.ANTsImage:
-        return ants.iMath(image, "Normalize")
+        return {
+            'warped': result['warpedmovout'],
+            'transform': result['fwdtransforms']
+        }
 
     def register(
         self,
-        fixed: ants.ANTsImage,
-        moving: ants.ANTsImage
-    ) -> dict:
-        fixed_norm = self.normalize_image(fixed)
-        moving_norm = self.normalize_image(moving)
-
-        return ants.registration(
-            fixed=fixed_norm,
-            moving=moving_norm,
-            type_of_transform=self.config.transform_type,
-            syn_metric=self.config.registration_metric.value,
-            reg_iterations=self.config.syn_iterations,
-            aff_iterations=self.config.affine_iterations,
+        moving: ants.ANTsImage,
+        fixed: ants.ANTsImage
+    ) -> Dict[str, Any]:
+        """Perform full SyNRA registration."""
+        result = ants.registration(
+            fixed=fixed,
+            moving=moving,
+            type_of_transform='SyNRA',
+            metric='mattes'
         )
-
-    def warp_coordinates(
-        self,
-        coordinates: pd.DataFrame,
-        transforms: list[str],
-        invert_flags: Optional[list[bool]] = None
-    ) -> pd.DataFrame:
-        if invert_flags is None:
-            invert_flags = [True, False]
-
-        return ants.apply_transforms_to_points(
-            dim=2,
-            points=coordinates.copy(),
-            transformlist=transforms,
-            whichtoinvert=invert_flags,
-        )
-
-    def coordinates_to_pixels(
-        self,
-        warped_points: pd.DataFrame,
-        reference_image: ants.ANTsImage
-    ) -> tuple[np.ndarray, np.ndarray]:
-        row_px = (warped_points['x'].to_numpy() - reference_image.origin[0]) / reference_image.spacing[0]
-        col_px = (warped_points['y'].to_numpy() - reference_image.origin[1]) / reference_image.spacing[1]
-        return row_px, col_px
+        return {
+            'warped': result['warpedmovout'],
+            'transform': result['fwdtransforms']
+        }
 
 
 class QualityController:
-    def __init__(self, config: RegistrationConfig):
-        self.config = config
+    """Evaluates registration quality and assigns pass/review/fail flags."""
+
+    def __init__(
+        self,
+        dice_pass: float = 0.5,
+        dice_review: float = 0.3,
+        corr_pass: float = 0.3,
+        corr_review: float = 0.2
+    ):
+        self.dice_pass = dice_pass
+        self.dice_review = dice_review
+        self.corr_pass = corr_pass
+        self.corr_review = corr_review
 
     def compute_metrics(
         self,
-        fixed: np.ndarray,
-        warped: np.ndarray
+        warped: ants.ANTsImage,
+        fixed: ants.ANTsImage,
+        pre_dice: float = 0.0,
+        pre_corr: float = 0.0
     ) -> QualityMetrics:
-        mi = self._mutual_information(fixed, warped)
-        correlation = self._correlation(fixed, warped)
-        dice = self._dice_overlap(fixed, warped)
+        warped_np = warped.numpy()
+        fixed_np = fixed.numpy()
 
-        converged = mi > self.config.similarity_threshold
-        quality_flag = self._determine_flag(mi, correlation, dice)
+        warped_binary = warped_np > np.percentile(warped_np, 10)
+        fixed_binary = fixed_np > 0
+
+        intersection = np.sum(warped_binary & fixed_binary)
+        union = np.sum(warped_binary) + np.sum(fixed_binary)
+        dice = 2 * intersection / union if union > 0 else 0.0
+
+        warped_flat = warped_np.flatten()
+        fixed_flat = fixed_np.flatten()
+        if warped_flat.std() > 0 and fixed_flat.std() > 0:
+            correlation = np.corrcoef(warped_flat, fixed_flat)[0, 1]
+        else:
+            correlation = 0.0
+
+        flag = self._assign_flag(pre_dice, pre_corr)
 
         return QualityMetrics(
-            mutual_information=mi,
+            dice_coefficient=dice,
             correlation=correlation,
-            dice_overlap=dice,
-            registration_converged=converged,
-            quality_flag=quality_flag
+            pre_registration_dice=pre_dice,
+            pre_registration_correlation=pre_corr,
+            flag=flag
         )
 
-    def _mutual_information(self, img1: np.ndarray, img2: np.ndarray) -> float:
-        hist_2d, _, _ = np.histogram2d(img1.ravel(), img2.ravel(), bins=50)
-        pxy = hist_2d / float(np.sum(hist_2d))
-        px = np.sum(pxy, axis=1)
-        py = np.sum(pxy, axis=0)
-        px_py = px[:, None] * py[None, :]
-
-        nonzero = pxy > 0
-        mi = np.sum(pxy[nonzero] * np.log(pxy[nonzero] / px_py[nonzero]))
-        return float(mi)
-
-    def _correlation(self, img1: np.ndarray, img2: np.ndarray) -> float:
-        return float(np.corrcoef(img1.ravel(), img2.ravel())[0, 1])
-
-    def _dice_overlap(
-        self,
-        img1: np.ndarray,
-        img2: np.ndarray,
-        threshold: float = 0.1
-    ) -> float:
-        mask1 = img1 > threshold * np.max(img1)
-        mask2 = img2 > threshold * np.max(img2)
-
-        intersection = np.sum(mask1 & mask2)
-        union = np.sum(mask1) + np.sum(mask2)
-
-        return float(2 * intersection / union) if union > 0 else 0.0
-
-    def _determine_flag(
-        self,
-        mi: float,
-        correlation: float,
-        dice: float
-    ) -> str:
-        if mi > 0.5 and correlation > 0.5 and dice > 0.5:
+    def _assign_flag(self, dice: float, corr: float) -> str:
+        if dice > self.dice_pass and corr > self.corr_pass:
             return "PASS"
-        elif mi > 0.3 or correlation > 0.3:
+        elif dice > self.dice_review or corr > self.corr_review:
             return "REVIEW"
-        return "FAIL"
+        else:
+            return "FAIL"
 
-    def generate_qc_visualization(
+
+class TransformSearcher:
+    """Search for optimal rotation and mirror transformations."""
+
+    def __init__(
         self,
-        moving_raster: np.ndarray,
-        atlas_slice: np.ndarray,
-        warped_image: np.ndarray,
-        warped_row_px: np.ndarray,
-        warped_col_px: np.ndarray,
-        slice_index: int,
-        output_path: str
+        config: RegistrationConfig,
+        registrar: ImageRegistrar,
+        qc: QualityController
     ):
-        fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+        self.config = config
+        self.registrar = registrar
+        self.qc = qc
 
-        axes[0].imshow(moving_raster, cmap=mpl.cm.Blues)
-        axes[0].set_title('Moving image raster')
+    def search(
+        self,
+        coords: np.ndarray,
+        atlas_slice: np.ndarray,
+        rotation_range: Tuple[float, float] = (0, 360),
+        rotation_step: float = 15.0,
+        search_mirror: bool = False
+    ) -> Tuple[float, bool]:
+        """
+        Search for best rotation and mirror combination.
 
-        axes[1].imshow(atlas_slice, cmap=mpl.cm.Reds)
-        axes[1].set_title(f'Atlas slice (idx={slice_index})')
+        Returns:
+            Tuple of (best_rotation_deg, best_mirror_x)
+        """
+        rotations = np.arange(rotation_range[0], rotation_range[1], rotation_step)
+        if len(rotations) == 0:
+            rotations = np.array([self.config.rotation_deg])
 
-        axes[2].imshow(atlas_slice, cmap=mpl.cm.Reds, alpha=0.5)
-        axes[2].imshow(warped_image, cmap=mpl.cm.Blues, alpha=0.5)
-        axes[2].set_title('Overlay')
+        mirror_options = [False, True] if search_mirror else [self.config.mirror_x]
 
-        axes[3].imshow(atlas_slice, cmap=mpl.cm.Greys)
-        axes[3].scatter(warped_col_px, warped_row_px, s=0.3, color='blue', alpha=0.3)
-        axes[3].set_title('Warped coordinates')
-        axes[3].set_xlim(0, atlas_slice.shape[1])
-        axes[3].set_ylim(atlas_slice.shape[0], 0)
+        candidates = []
+        for rot in rotations:
+            for mirror in mirror_options:
+                coverage = self._compute_coverage(coords, atlas_slice, rot, mirror)
+                candidates.append((float(rot), mirror, coverage))
 
-        for ax in axes:
-            ax.set_aspect('equal')
+        max_coverage = max(c[2] for c in candidates)
 
-        plt.tight_layout()
-        plt.savefig(output_path, dpi=150, bbox_inches='tight')
-        plt.close()
+        tolerance = 0.01
+        best_candidates = [(r, m) for r, m, c in candidates if c >= max_coverage - tolerance]
+
+        if len(best_candidates) == 1:
+            return best_candidates[0]
+
+        return self._tiebreak_with_affine(coords, atlas_slice, best_candidates)
+
+    def _compute_coverage(
+        self,
+        coords: np.ndarray,
+        atlas_slice: np.ndarray,
+        rotation_deg: float,
+        mirror_x: bool
+    ) -> float:
+        """Compute fraction of transformed points falling within atlas mask."""
+        temp_config = RegistrationConfig(
+            rotation_deg=rotation_deg,
+            scale=self.config.scale,
+            mirror_x=mirror_x,
+            resolution_um=self.config.resolution_um,
+            blur_sigma=self.config.blur_sigma
+        )
+
+        transformed = transform_coordinates(coords, temp_config)
+
+        atlas_shape = atlas_slice.shape
+        atlas_mask = atlas_slice > 0
+
+        _, _, density = rasterize(transformed, atlas_shape, temp_config.blur_sigma)
+
+        density_mask = density > 0
+        overlap = np.sum(density_mask & atlas_mask)
+        total_density = np.sum(density_mask)
+
+        return overlap / total_density if total_density > 0 else 0.0
+
+    def _tiebreak_with_affine(
+        self,
+        coords: np.ndarray,
+        atlas_slice: np.ndarray,
+        candidates: List[Tuple[float, bool]]
+    ) -> Tuple[float, bool]:
+        """Use affine registration correlation to break ties."""
+        best_corr = -1.0
+        best_candidate = candidates[0]
+
+        atlas_ants = ants.from_numpy(atlas_slice.astype(np.float32))
+
+        for rotation_deg, mirror_x in candidates:
+            temp_config = RegistrationConfig(
+                rotation_deg=rotation_deg,
+                scale=self.config.scale,
+                mirror_x=mirror_x,
+                resolution_um=self.config.resolution_um,
+                blur_sigma=self.config.blur_sigma
+            )
+
+            transformed = transform_coordinates(coords, temp_config)
+            _, _, density = rasterize(transformed, atlas_slice.shape, temp_config.blur_sigma)
+
+            omics_ants = ants.from_numpy(density.astype(np.float32))
+
+            try:
+                result = self.registrar.affine_register(omics_ants, atlas_ants)
+                metrics = self.qc.compute_metrics(result['warped'], atlas_ants)
+
+                if metrics.correlation > best_corr:
+                    best_corr = metrics.correlation
+                    best_candidate = (rotation_deg, mirror_x)
+            except Exception:
+                continue
+
+        return best_candidate
 
 
 class RegistrationPipeline:
-    def __init__(self, config: RegistrationConfig, output_dir: str):
-        self.config = config
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+    """Main pipeline orchestrating the registration workflow."""
 
+    def __init__(
+        self,
+        atlas_path: Path,
+        config: RegistrationConfig,
+        orientation: SliceOrientation = SliceOrientation.CORONAL
+    ):
+        self.atlas_loader = AtlasLoader(atlas_path)
         self.preprocessor = SpatialOmicsPreprocessor(config)
         self.registrar = ImageRegistrar(config)
-        self.qc = QualityController(config)
-        self.atlas_loader: Optional[AtlasLoader] = None
+        self.qc = QualityController()
+        self.config = config
+        self.orientation = orientation
 
-    def load_atlas(self, atlas_path: str):
-        self.atlas_loader = AtlasLoader(atlas_path)
-        print(f"Loaded atlas: {atlas_path}")
-        print(f"  Shape: {self.atlas_loader.shape}")
-        print(f"  Voxel spacing: {self.atlas_loader.voxel_spacing}")
+    def run_single_slice(self, omics_path: Path, slice_idx: int) -> RegistrationResult:
+        coords = extract_coordinates(omics_path)
+        atlas_slice = self.atlas_loader.get_slice(slice_idx, self.orientation)
 
-    def run(
-        self,
-        omics_path: str,
-        atlas_slice_index: int,
-        orientation: SliceOrientation,
-        output_prefix: Optional[str] = None,
-        coordinate_transform_params: Optional[dict] = None
-    ) -> RegistrationResult:
-        if self.atlas_loader is None:
-            raise ValueError("Atlas not loaded. Call load_atlas() first.")
+        rotation_deg = self.config.rotation_deg
+        mirror_x = self.config.mirror_x
+        detected_rotation = None
+        detected_mirror = None
 
-        if output_prefix is None:
-            output_prefix = Path(omics_path).stem + f"_to_slice{atlas_slice_index}"
+        if self.config.search_rotation or self.config.search_mirror:
+            searcher = TransformSearcher(self.config, self.registrar, self.qc)
 
-        omics_df = self.preprocessor.load_data(omics_path)
-        z_values = self.preprocessor.get_unique_z_values(omics_df)
+            if self.config.search_rotation:
+                rotation_range = self.config.rotation_range
+                rotation_step = self.config.rotation_step
+            else:
+                rotation_range = (self.config.rotation_deg, self.config.rotation_deg + 1)
+                rotation_step = 360.0
 
-        if len(z_values) > 1:
-            print(f"Warning: Multiple z-values found: {z_values}. Using first value.")
+            rotation_deg, mirror_x = searcher.search(
+                coords, atlas_slice,
+                rotation_range=rotation_range,
+                rotation_step=rotation_step,
+                search_mirror=self.config.search_mirror
+            )
+            detected_rotation = rotation_deg
+            detected_mirror = mirror_x
 
-        z_value = z_values[0]
-        filtered_df = self.preprocessor.filter_by_z(omics_df, z_value)
-        print(f"Processing {len(filtered_df)} cells at z={z_value}")
-
-        x, y = self.preprocessor.extract_coordinates(filtered_df)
-
-        transform_params = coordinate_transform_params or {
-            'rotation_deg': 270.0,
-            'scale': (0.9, 0.9),
-            'mirror_x': True
-        }
-        x_trans, y_trans = self.preprocessor.transform_coordinates(x, y, **transform_params)
-        x_centered, y_centered = self.preprocessor.center_coordinates(x_trans, y_trans)
-
-        x_grid, y_grid, density = self.preprocessor.rasterize(y_centered, x_centered)
-
-        atlas_slice, atlas_metadata = self.atlas_loader.get_slice(atlas_slice_index, orientation)
-
-        moving_metadata = ImageMetadata(
-            origin=(float(y_grid[0]), float(x_grid[0])),
-            spacing=(self.config.rasterization_resolution, self.config.rasterization_resolution),
-            shape=density.shape
+        working_config = RegistrationConfig(
+            rotation_deg=rotation_deg,
+            scale=self.config.scale,
+            mirror_x=mirror_x,
+            resolution_um=self.config.resolution_um,
+            blur_sigma=self.config.blur_sigma
         )
 
-        fixed_ants = self.registrar.create_ants_image(atlas_slice, atlas_metadata)
-        moving_ants = self.registrar.create_ants_image(density, moving_metadata)
-
-        print("Running registration...")
-        reg_result = self.registrar.register(fixed_ants, moving_ants)
-
-        points_df = pd.DataFrame({'x': x_centered, 'y': y_centered})
-        warped_points = self.registrar.warp_coordinates(
-            points_df,
-            reg_result['invtransforms']
+        transformed = transform_coordinates(coords, working_config)
+        X_grid, Y_grid, density = rasterize(
+            transformed, atlas_slice.shape, working_config.blur_sigma
         )
 
-        row_px, col_px = self.registrar.coordinates_to_pixels(warped_points, fixed_ants)
+        omics_ants = ants.from_numpy(density.astype(np.float32))
+        atlas_ants = ants.from_numpy(atlas_slice.astype(np.float32))
 
-        warped_image = reg_result['warpedmovout'].numpy()
-        quality_metrics = self.qc.compute_metrics(atlas_slice, warped_image)
+        affine_result = self.registrar.affine_register(omics_ants, atlas_ants)
+        pre_metrics = self.qc.compute_metrics(affine_result['warped'], atlas_ants)
 
-        qc_path = self.output_dir / f"{output_prefix}_qc.png"
-        self.qc.generate_qc_visualization(
-            density, atlas_slice, warped_image,
-            row_px, col_px, atlas_slice_index,
-            str(qc_path)
+        result = self.registrar.register(omics_ants, atlas_ants)
+
+        quality = self.qc.compute_metrics(
+            result['warped'], atlas_ants,
+            pre_dice=pre_metrics.dice_coefficient,
+            pre_corr=pre_metrics.correlation
         )
-        print(f"Saved QC visualization: {qc_path}")
 
-        output_df = filtered_df.copy()
-        output_df['ccf_x'] = warped_points['x'].to_numpy() / 1000.0
-        output_df['ccf_y'] = warped_points['y'].to_numpy() / 1000.0
-        output_df['ccf_z'] = z_value
-
-        output_csv = self.output_dir / f"{output_prefix}_registered.csv"
-        keep_cols = ['cell_label', 'x', 'y', 'z', 'ccf_x', 'ccf_y', 'ccf_z']
-        available_cols = [c for c in keep_cols if c in output_df.columns]
-        output_df[available_cols].to_csv(output_csv, index=False)
-        print(f"Saved registered coordinates: {output_csv}")
+        metadata = ImageMetadata(
+            source_path=omics_path,
+            slice_index=slice_idx,
+            orientation=self.orientation,
+            original_shape=density.shape,
+            resolution_um=working_config.resolution_um
+        )
 
         return RegistrationResult(
-            warped_image=warped_image,
-            forward_transforms=reg_result['fwdtransforms'],
-            inverse_transforms=reg_result['invtransforms'],
-            warped_coordinates=warped_points,
-            quality_metrics=quality_metrics,
-            fixed_metadata=atlas_metadata,
-            moving_metadata=moving_metadata
+            metadata=metadata,
+            config=working_config,
+            quality=quality,
+            transform=result['transform'],
+            warped_image=result['warped'].numpy(),
+            detected_rotation=detected_rotation,
+            detected_mirror=detected_mirror
         )
 
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Register spatial omics data to brain atlas",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python registration_pipeline.py \\
-      --atlas data/aba_nissl.nrrd \\
-      --omics data/abca3_slice_13_cell_metadata.csv \\
-      --slice 64
-
-  python registration_pipeline.py \\
-      -a data/aba_nissl.nrrd \\
-      -i data/cells.csv \\
-      -s 64 \\
-      --rotation 180 \\
-      --scale 1.0 1.0 \\
-      --no-mirror
-        """
-    )
-
-    parser.add_argument("--atlas", "-a", required=True, help="Path to atlas NRRD file")
-    parser.add_argument("--omics", "-i", required=True, help="Path to spatial omics CSV file")
-    parser.add_argument("--slice", "-s", type=int, required=True, help="Atlas slice index")
-    parser.add_argument(
-        "--orientation", "-r",
-        choices=["sagittal", "coronal", "axial"],
-        default="sagittal",
-        help="Slice orientation (default: sagittal)"
-    )
-    parser.add_argument("--output", "-o", default="./registration_results", help="Output directory")
-    parser.add_argument("--prefix", "-p", default=None, help="Output file prefix")
-    parser.add_argument("--rotation", type=float, default=270.0, help="Initial rotation in degrees")
-    parser.add_argument(
-        "--scale",
-        type=float,
-        nargs=2,
-        default=[0.9, 0.9],
-        metavar=("X", "Y"),
-        help="Scale factors for x and y"
-    )
-    parser.add_argument("--no-mirror", action="store_true", help="Disable x-axis mirroring")
-    parser.add_argument("--resolution", type=float, default=50.0, help="Rasterization resolution in microns")
-    parser.add_argument("--blur", type=float, default=1.0, help="Gaussian blur sigma")
-
-    return parser.parse_args()
+    def run_batch(
+        self,
+        omics_paths: List[Path],
+        slice_indices: List[int]
+    ) -> List[RegistrationResult]:
+        results = []
+        for omics_path, slice_idx in zip(omics_paths, slice_indices):
+            result = self.run_single_slice(omics_path, slice_idx)
+            results.append(result)
+        return results
 
 
 def main():
-    args = parse_args()
+    parser = argparse.ArgumentParser(
+        description='Register spatial omics data to developmental brain atlas'
+    )
+    parser.add_argument('--atlas', type=Path, required=True,
+                        help='Path to 3D atlas volume (.npy or .nii)')
+    parser.add_argument('--omics', type=Path, required=True,
+                        help='Path to spatial omics CSV file')
+    parser.add_argument('--slice', type=int, required=True,
+                        help='Atlas slice index')
+    parser.add_argument('--orientation', type=str, default='coronal',
+                        choices=['coronal', 'sagittal', 'axial'],
+                        help='Slice orientation (default: coronal)')
+    parser.add_argument('--output', type=Path, default=Path('output'),
+                        help='Output directory (default: output)')
+    parser.add_argument('--rotation', type=float, default=0.0,
+                        help='Initial rotation in degrees (default: 0.0)')
+    parser.add_argument('--scale', type=float, nargs=2, default=[0.9, 0.9],
+                        help='Scale factors for y and x (default: 0.9 0.9)')
+    parser.add_argument('--mirror', action='store_true',
+                        help='Apply mirror transformation along x-axis')
+    parser.add_argument('--resolution', type=float, default=50.0,
+                        help='Resolution in micrometers (default: 50.0)')
+    parser.add_argument('--blur', type=float, default=1.0,
+                        help='Gaussian blur sigma (default: 1.0)')
+    parser.add_argument('--search-rotation', action='store_true',
+                        help='Search for optimal rotation angle')
+    parser.add_argument('--rotation-step', type=float, default=15.0,
+                        help='Rotation search step in degrees (default: 15.0)')
+    parser.add_argument('--search-mirror', action='store_true',
+                        help='Search both mirrored and non-mirrored orientations')
 
-    orientation_map = {
-        "sagittal": SliceOrientation.SAGITTAL,
-        "coronal": SliceOrientation.CORONAL,
-        "axial": SliceOrientation.AXIAL
-    }
+    args = parser.parse_args()
 
     config = RegistrationConfig(
-        rasterization_resolution=args.resolution,
-        gaussian_blur_sigma=args.blur,
-        registration_metric=RegistrationMetric.MATTES,
-        transform_type="SyNRA"
+        rotation_deg=args.rotation,
+        scale=tuple(args.scale),
+        mirror_x=args.mirror,
+        resolution_um=args.resolution,
+        blur_sigma=args.blur,
+        search_rotation=args.search_rotation,
+        rotation_step=args.rotation_step,
+        search_mirror=args.search_mirror
     )
 
-    pipeline = RegistrationPipeline(config=config, output_dir=args.output)
-    pipeline.load_atlas(args.atlas)
+    orientation = SliceOrientation(args.orientation)
 
-    coordinate_transform_params = {
-        'rotation_deg': args.rotation,
-        'scale': tuple(args.scale),
-        'mirror_x': not args.no_mirror
+    pipeline = RegistrationPipeline(args.atlas, config, orientation)
+    result = pipeline.run_single_slice(args.omics, args.slice)
+
+    args.output.mkdir(parents=True, exist_ok=True)
+
+    np.save(args.output / 'warped.npy', result.warped_image)
+
+    summary = {
+        'source': str(result.metadata.source_path),
+        'slice_index': result.metadata.slice_index,
+        'orientation': result.metadata.orientation.value,
+        'rotation_deg': result.config.rotation_deg,
+        'mirror_x': result.config.mirror_x,
+        'scale': result.config.scale,
+        'dice': result.quality.dice_coefficient,
+        'correlation': result.quality.correlation,
+        'pre_dice': result.quality.pre_registration_dice,
+        'pre_correlation': result.quality.pre_registration_correlation,
+        'flag': result.quality.flag,
+        'detected_rotation': result.detected_rotation,
+        'detected_mirror': result.detected_mirror
     }
 
-    print(f"\n{'='*60}")
-    print("Registration Parameters")
-    print(f"{'='*60}")
-    print(f"Atlas:       {args.atlas}")
-    print(f"Omics data:  {args.omics}")
-    print(f"Atlas slice: {args.slice}")
-    print(f"Orientation: {args.orientation}")
-    print(f"Rotation:    {args.rotation}°")
-    print(f"Scale:       {args.scale}")
-    print(f"Mirror X:    {not args.no_mirror}")
-    print(f"Resolution:  {args.resolution} µm")
-    print(f"Blur sigma:  {args.blur}")
-    print(f"Output:      {args.output}")
-    print(f"{'='*60}\n")
+    summary_df = pd.DataFrame([summary])
+    summary_df.to_csv(args.output / 'summary.csv', index=False)
 
-    result = pipeline.run(
-        omics_path=args.omics,
-        atlas_slice_index=args.slice,
-        orientation=orientation_map[args.orientation],
-        output_prefix=args.prefix,
-        coordinate_transform_params=coordinate_transform_params
-    )
-
-    print(f"\n{'='*60}")
-    print("Registration Results")
-    print(f"{'='*60}")
-    print(f"Quality Flag:        {result.quality_metrics.quality_flag}")
-    print(f"Mutual Information:  {result.quality_metrics.mutual_information:.4f}")
-    print(f"Correlation:         {result.quality_metrics.correlation:.4f}")
-    print(f"Dice Overlap:        {result.quality_metrics.dice_overlap:.4f}")
-    print(f"Converged:           {result.quality_metrics.registration_converged}")
-    print(f"{'='*60}")
+    print(f"Registration complete: {result.quality.flag}")
+    print(f"  Dice: {result.quality.dice_coefficient:.3f}")
+    print(f"  Correlation: {result.quality.correlation:.3f}")
+    print(f"  Pre-registration Dice: {result.quality.pre_registration_dice:.3f}")
+    print(f"  Pre-registration Correlation: {result.quality.pre_registration_correlation:.3f}")
+    print(f"  Rotation: {result.config.rotation_deg:.1f}°")
+    print(f"  Mirror: {result.config.mirror_x}")
+    if result.detected_rotation is not None:
+        print(f"  Detected rotation: {result.detected_rotation:.1f}°")
+    if result.detected_mirror is not None:
+        print(f"  Detected mirror: {result.detected_mirror}")
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
