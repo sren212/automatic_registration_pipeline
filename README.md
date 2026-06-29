@@ -23,3 +23,12 @@ Ensure you have the required system and Python dependencies installed.
 
 ```bash
 pip install numpy pandas pynrrd antspyx scipy matplotlib
+```
+
+---
+
+## Example Run
+
+```bash
+ce_13_cell_metadata_rot30.csv --slice 64
+```
